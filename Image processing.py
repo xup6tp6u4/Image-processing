@@ -1,114 +1,109 @@
 import cv2
 import numpy as np
-from skimage import measure
 import matplotlib.pyplot as plt
 
-# 1. 讀取影像並轉換為灰階圖像
-img = cv2.imread('D:/input_image.jpg')
-gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # 轉換為灰階圖像
+# 1. 將影像分割成固定大小的區塊
+def to_blocks(img: np.ndarray, block_size: int) -> np.ndarray:
+    height, width = img.shape
+    n_blocks_height = int(np.ceil(height / block_size))
+    n_blocks_width = int(np.ceil(width / block_size))
+    blocks = np.zeros((n_blocks_height, n_blocks_width, block_size, block_size), dtype=np.uint8)
+    for i in range(n_blocks_height):
+        for j in range(n_blocks_width):
+            block = img[i * block_size:(i + 1) * block_size, j * block_size:(j + 1) * block_size]
+            blocks[i, j, :, :] = block
+    return blocks
 
-# 2. Sobel邊緣檢測
-def sobel_edge_detection(image):
-    # Sobel kernel
-    sobel_x_kernel = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-    sobel_y_kernel = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+# 2. 計算區塊的 LBP 特徵
+def manual_lbp(block):
+    lbp = np.zeros_like(block, dtype=np.uint8)
+    for i in range(1, block.shape[0] - 1):
+        for j in range(1, block.shape[1] - 1):
+            center = block[i, j]
+            binary_string = "".join(['1' if block[i + dx, j + dy] >= center else '0'
+                                     for dx, dy in [(-1, -1), (-1, 0), (-1, 1), (0, 1),
+                                                    (1, 1), (1, 0), (1, -1), (0, -1)]] )
+            lbp[i, j] = int(binary_string, 2)
+    return lbp
 
-    # 卷積
-    sobel_x = cv2.filter2D(image, -1, sobel_x_kernel)
-    sobel_y = cv2.filter2D(image, -1, sobel_y_kernel)
-
-    # 計算邊緣強度
-    sobel_magnitude = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
-    sobel_magnitude = np.uint8(sobel_magnitude / sobel_magnitude.max() * 255)
-    
-    return sobel_magnitude
-
-sobel_img = sobel_edge_detection(gray_img)
-
-# 3. LBP 編碼
-def manual_lbp(image, radius=1, n_points=8):
-    lbp_img = np.zeros_like(image, dtype=np.uint8)
-    for i in range(radius, image.shape[0] - radius):
-        for j in range(radius, image.shape[1] - radius):
-            center = image[i, j]
-            binary_pattern = 0
-            for k in range(n_points):
-                # 計算鄰居點的位置
-                theta = 2 * np.pi * k / n_points
-                y = int(i + radius * np.sin(theta))
-                x = int(j + radius * np.cos(theta))
-                # 比較中心像素與鄰居像素
-                binary_pattern <<= 1
-                if image[y, x] >= center:
-                    binary_pattern |= 1
-            lbp_img[i, j] = binary_pattern
-    return lbp_img
-
-lbp_img = manual_lbp(sobel_img)
-
-# 計算直方圖
-def manual_histogram(image, bins, range_):
-    hist = np.zeros(bins, dtype=np.float32)
-    bin_width = (range_[1] - range_[0]) / bins
-    for value in image.ravel():
-        bin_index = int((value - range_[0]) / bin_width)
-        if 0 <= bin_index < bins:
-            hist[bin_index] += 1
+# 3. 計算每個區塊的 LBP 直方圖
+def blocks_to_hist(blocks):
+    num_blocks_y, num_blocks_x, _, _ = blocks.shape
+    hist = np.zeros((num_blocks_y, num_blocks_x, 256), dtype=np.float32)
+    for y in range(num_blocks_y):
+        for x in range(num_blocks_x):
+            lbp_block = manual_lbp(blocks[y, x])
+            hist[y, x] = np.histogram(lbp_block.ravel(), bins=256, range=(0, 256))[0]
+            hist[y, x] = hist[y, x] / hist[y, x].sum()  # Normalize
     return hist
 
-n_points = 8  # LBP的點數
-histogram = manual_histogram(lbp_img, bins=n_points + 2, range_=(0, n_points + 2))
-histogram /= histogram.sum()  # 正規化直方圖
+# 4. 基於特徵進行 BFS 搜索，找出相似區塊
+def bfs_with_feature(_x, _y, _hist, target_feature, threshold=0.85):
+    num_blocks_y, num_blocks_x, _ = _hist.shape
+    queue = [(_x, _y)]
+    _result = []
+    visited = set()
+    visited.add((_x, _y))
+    while queue:
+        currentVertex = queue.pop(0)
+        for di, dj in [(-1, 0), (0, 1), (1, 0), (0, -1)]:
+            new_x, new_y = currentVertex[0] + di, currentVertex[1] + dj
+            if new_x < 0 or new_x >= num_blocks_x or new_y < 0 or new_y >= num_blocks_y:
+                continue
+            if (new_x, new_y) in visited:
+                continue
+            # 只比對區塊內是否包含最常見的特徵值
+            if _hist[new_y, new_x, target_feature] >= threshold * _hist[new_y, new_x].sum():
+                _result.append((new_x, new_y))
+                queue.append((new_x, new_y))
+                visited.add((new_x, new_y))
+    return _result
 
-# 4. 搜尋：根據直方圖找相似數值
-search result = np.zeros_like(gray_img, dtype=np.uint8)
-threshold = 0.1  # 設定搜尋的閾值
+# 5. 顯示影像
+def display(img, cmap=None):
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111)
+    ax.imshow(img, cmap=cmap)
+    plt.show()
 
-# 計算每個區域的直方圖並進行比對
-for i in range(0, gray_img.shape[0] - 3, 3):  # 以3x3區塊進行搜尋
-    for j in range(0, gray_img.shape[1] - 3, 3):
-        # 擷取區域
-        patch = lbp_img[i:i+3, j:j+3]
-        # 計算區域的LBP直方圖
-        patch_histogram = manual_histogram(patch, bins=n_points + 2, range_=(0, n_points + 2))
-        patch_histogram /= patch_histogram.sum()  # 正規化直方圖
-        
-        # 計算每個區域的直方圖與相鄰區塊直方圖的歐氏距離
-        for di in range(0, gray_img.shape[0] - 3, 3):
-            for dj in range(0, gray_img.shape[1] - 3, 3):
-                # 擷取鄰近區域
-                neighbor_patch = lbp_img[di:di+3, dj:dj+3]
-                neighbor_histogram = manual_histogram(neighbor_patch, bins=n_points + 2, range_=(0, n_points + 2))
-                neighbor_histogram /= neighbor_histogram.sum()  # 正規化直方圖
-                
-                # 計算直方圖的歐氏距離
-                distance = np.linalg.norm(patch_histogram - neighbor_histogram)
-                
-                # 如果距離小於閾值，則標註為相似
-                if distance < threshold:
-                    search_result[i:i+3, j:j+3] = 255  # 標註為白色區域
+# 主要流程
+if __name__ == '__main__':
+    # 1. 讀取影像並轉換為灰度圖
+    img = cv2.imread('D:/input_image.jpg')
+    img = cv2.resize(img, (490, 350), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-# 5. 塗色標註 (使用標籤)
-labeled_img = measure.label(search_result)  # 使用連通元件標註
-colored_img = cv2.applyColorMap(labeled_img.astype(np.uint8) * 50, cv2.COLORMAP_JET)  # 塗上顏色
+    # 2. Sobel 邊緣檢測
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobel = cv2.magnitude(sobel_x, sobel_y)
+    sobel = cv2.convertScaleAbs(sobel)
 
-# 顯示結果
-plt.figure(figsize=(10, 8))
+    # 3. 分割影像成區塊
+    block_size = 16
+    blocks = to_blocks(sobel, block_size)
 
-# 顯示原始圖片
-plt.subplot(1, 3, 1)
-plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-plt.title('Original Image')
+    # 4. 計算每個區塊的 LBP 直方圖
+    hist = blocks_to_hist(blocks)
 
-# 顯示Sobel邊緣檢測結果
-plt.subplot(1, 3, 2)
-plt.imshow(sobel_img, cmap='gray')
-plt.title('Sobel Edge Detection')
+    num_blocks_y, num_blocks_x, _ = hist.shape
 
-# 顯示塗色標註結果
-plt.subplot(1, 3, 3)
-plt.imshow(cv2.cvtColor(colored_img, cv2.COLOR_BGR2RGB))
-plt.title('Search & Labeling')
+    # 5. 計算底部三排區塊的 LBP 直方圖，並找出最頻繁的特徵值
+    bottom_blocks = hist[-3:, :, :]  # 選擇底部三排
+    flattened_hist = bottom_blocks.reshape(-1, 256)
+    most_common_feature = np.argmax(flattened_hist.sum(axis=0))  # 找出最常見的特徵值
 
-plt.tight_layout()
-plt.show()
+    # 6. 使用底部中間區塊作為 BFS 起始點
+    start_x, start_y = num_blocks_x // 2, num_blocks_y - 1
+    result = bfs_with_feature(start_x, start_y, hist, most_common_feature, threshold=0.273)
+
+    # 7. 將結果還原成影像
+    img2 = np.zeros((num_blocks_y * block_size, num_blocks_x * block_size, 3), dtype=np.uint8)
+    for j, i in result:
+        img2[j * block_size:(j + 1) * block_size, i * block_size:(i + 1) * block_size, 0] = 255
+    result_img = cv2.add(img, img2)
+
+    # 8. 顯示結果
+    cv2.imshow('LBP Road Detection', result_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
